@@ -1,0 +1,14 @@
+{
+  "name": "pi-agents-toggle",
+  "version": "0.1.0",
+  "description": "Toggle, edit, or empty AGENTS.md / CLAUDE.md context files from inside Pi, with a tree view, vim keys, and a status-bar indicator.",
+  "keywords": ["pi-package", "pi", "agents-md", "context"],
+  "license": "MIT",
+  "type": "module",
+  "files": ["index.ts", "README.md", "LICENSE"],
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
