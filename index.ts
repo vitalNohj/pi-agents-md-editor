@@ -2,17 +2,22 @@
  * pi-agents-toggle
  *
  * Toggle, edit, or empty AGENTS.md / CLAUDE.md context files from inside Pi.
- * Changes are a session overlay: files on disk stay untouched unless you
- * explicitly write one with `E`. Changes apply "forward": from your next
- * message, Pi appends a prompt-section update so the model sees the new
- * project_context from then on.
+ * Toggles and edits are a global overlay saved in <agent-dir>/agents-toggle.json;
+ * files on disk stay untouched unless you explicitly write one with `E`.
  *
- *   /agents          open the tree window
- *   /agents off      send no context files
- *   /agents on       turn context files back on (keeps line toggles)
- *   /agents reset    drop every toggle and edit
+ * Every session keeps the context it started with. When you apply a change you
+ * choose what happens to the current session:
+ *   save     (default) nothing; new sessions get the change
+ *   next     on your next prompt, the AGENTS block is swapped in place, as if the
+ *            session always had it (invalidates the prompt cache once)
+ *   restart  fork the session with the AGENTS block replaced in its stored history
+ *            and switch to the fork now
+ *
+ *   /agents                       open the tree window
+ *   /agents off|on|reset [--next|--restart]
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -26,8 +31,6 @@ interface FileState {
 	off?: boolean;
 	disabled: string[];
 	edits: Record<string, string>;
-	/** File was rewritten on disk through this extension; re-read it instead of Pi's startup copy. */
-	diskDirty?: boolean;
 }
 
 interface State {
@@ -35,37 +38,57 @@ interface State {
 	files: Record<string, FileState>;
 }
 
+type ContextFile = { path: string; content: string };
+type Mode = "save" | "next" | "restart";
+
 const ENTRY = "agents-toggle";
+const SECTION = "project_context";
 const emptyState = (): State => ({ allOff: false, files: {} });
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 const fileState = (s: State, path: string): FileState => (s.files[path] ??= { disabled: [], edits: {} });
+const stripBom = (s: string) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
 function isDirty(s: State): boolean {
-	return (
-		s.allOff ||
-		Object.values(s.files).some((f) => f.off || f.diskDirty || f.disabled.length > 0 || Object.keys(f.edits).length > 0)
-	);
+	return s.allOff || Object.values(s.files).some((f) => f.off || f.disabled.length > 0 || Object.keys(f.edits).length > 0);
 }
 
-// ---------------------------------------------------------------- settings (vim mode)
+/** Drop empty per-file entries so the saved config stays readable. */
+function normalize(s: State): State {
+	const out: State = { allOff: s.allOff, files: {} };
+	for (const [p, f] of Object.entries(s.files)) {
+		if (f.off || f.disabled.length || Object.keys(f.edits).length) out.files[p] = f;
+	}
+	return out;
+}
 
-const settingsPath = () => join(getAgentDir(), "agents-toggle.json");
+// ---------------------------------------------------------------- global config
 
-function loadVim(): boolean {
+const configPath = () => join(getAgentDir(), "agents-toggle.json");
+
+function readConfig(): { vim: boolean; state: State } {
 	try {
-		return JSON.parse(readFileSync(settingsPath(), "utf8")).vim === true;
+		const raw = JSON.parse(readFileSync(configPath(), "utf8"));
+		return { vim: raw.vim === true, state: { allOff: raw.allOff === true, files: raw.files ?? {} } };
 	} catch {
-		return false;
+		return { vim: false, state: emptyState() };
 	}
 }
 
-function saveVim(vim: boolean): void {
+function writeConfig(patch: { vim?: boolean; state?: State }): void {
+	const cur = readConfig();
+	const vim = patch.vim ?? cur.vim;
+	const state = normalize(patch.state ?? cur.state);
+	writeFileSync(configPath(), `${JSON.stringify({ vim, ...state }, null, 2)}\n`);
+}
+
+const loadVim = () => readConfig().vim;
+const saveVim = (vim: boolean) => {
 	try {
-		writeFileSync(settingsPath(), `${JSON.stringify({ vim }, null, 2)}\n`);
+		writeConfig({ vim });
 	} catch {
 		// non-fatal: preference just won't persist
 	}
-}
+};
 
 // ---------------------------------------------------------------- markdown -> tree
 
@@ -163,16 +186,106 @@ function applyFile(content: string, fs: FileState | undefined): string {
 	return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function applyAll(files: { path: string; content: string }[], s: State): { path: string; content: string }[] {
+function applyAll(files: ContextFile[], s: State): ContextFile[] {
 	if (s.allOff) return [];
 	return files
-		.map((f) => {
-			const fs = s.files[f.path];
-			const base = fs?.diskDirty && existsSync(f.path) ? readFileSync(f.path, "utf8") : f.content;
-			return { path: f.path, content: applyFile(base, fs) };
-		})
+		.map((f) => ({ path: f.path, content: applyFile(f.content, s.files[f.path]) }))
 		.filter((f) => f.content.trim().length > 0);
 }
+
+// ---------------------------------------------------------------- the project_context prompt section
+
+/** Same rendering as Pi's system-prompt builder, including the section tags. */
+function renderSection(files: ContextFile[]): string | undefined {
+	if (!files.length) return undefined;
+	const body = [
+		"Project-specific instructions and guidelines:",
+		...files.map(({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`),
+	].join("\n\n");
+	return `<${SECTION}>\n${body}\n</${SECTION}>`;
+}
+
+function parseSection(section: string | undefined): ContextFile[] {
+	if (!section) return [];
+	const files: ContextFile[] = [];
+	const re = /<project_instructions path="([^"]*)">\n([\s\S]*?)\n<\/project_instructions>(?=\n\n<project_instructions path=|\n<\/project_context>$)/g;
+	for (const m of section.matchAll(re)) files.push({ path: m[1], content: m[2] });
+	return files;
+}
+
+interface SystemLike {
+	role: "system";
+	content: unknown;
+	sections?: Record<string, string | null>;
+	toolsAdded?: unknown[];
+	toolsRemoved?: unknown[];
+}
+const isSystem = (m: unknown): m is SystemLike => (m as { role?: string } | undefined)?.role === "system";
+
+/**
+ * The project_context section the transcript currently carries: the leading message's
+ * value with later section updates applied. `undefined` means the transcript has no
+ * system prompt yet (a session that has not been prompted).
+ */
+function transcriptSection(messages: unknown[]): { has: boolean; value: string | undefined } {
+	let has = false;
+	let value: string | undefined;
+	for (const m of messages) {
+		if (!isSystem(m)) continue;
+		has = true;
+		if (m.sections && SECTION in m.sections) value = m.sections[SECTION] ?? undefined;
+	}
+	return { has, value };
+}
+
+/** Put project_context where Pi would: before skills/cwd/custom sections. */
+function withSection(sections: Record<string, string | null>, value: string | undefined): Record<string, string | null> {
+	const out: Record<string, string | null> = {};
+	let placed = value === undefined;
+	for (const [k, v] of Object.entries(sections)) {
+		if (k === SECTION) continue;
+		if (!placed && (k === "skills" || k === "cwd")) {
+			out[SECTION] = value as string;
+			placed = true;
+		}
+		out[k] = v;
+	}
+	if (!placed) out[SECTION] = value as string;
+	return out;
+}
+
+/**
+ * Rewrite a transcript so the latest project_context lives in the leading prompt and no
+ * later message mentions it: the model sees one prompt, as if it always had this context.
+ */
+function collapse<T>(messages: T[]): T[] {
+	const { has, value } = transcriptSection(messages);
+	if (!has) return messages;
+	let leading = true;
+	const out: T[] = [];
+	for (const m of messages) {
+		if (!isSystem(m)) {
+			out.push(m);
+			continue;
+		}
+		if (leading) {
+			leading = false;
+			out.push({ ...m, sections: withSection(m.sections ?? {}, value) });
+			continue;
+		}
+		if (!m.sections || !(SECTION in m.sections)) {
+			out.push(m);
+			continue;
+		}
+		const { [SECTION]: _drop, ...rest } = m.sections;
+		const empty =
+			!Object.keys(rest).length && !m.toolsAdded?.length && !m.toolsRemoved?.length && !String(m.content ?? "").length;
+		if (!empty) out.push({ ...m, sections: rest });
+	}
+	return out;
+}
+
+const sameFiles = (a: ContextFile[], b: ContextFile[]) => JSON.stringify(a) === JSON.stringify(b);
 
 // ---------------------------------------------------------------- tree UI
 
@@ -206,12 +319,12 @@ function counts(files: FileView[], s: State): { on: number; total: number } {
 	return { on, total };
 }
 
-function statusText(files: FileView[], s: State): string {
-	if (s.allOff) return "AGENTS off";
-	if (!isDirty(s)) return "AGENTS on";
+function stateLabel(files: FileView[], s: State): string {
+	if (s.allOff) return "off";
+	if (!isDirty(s)) return "on";
 	const { on, total } = counts(files, s);
-	const edited = Object.values(s.files).some((f) => Object.keys(f.edits).length > 0 || f.diskDirty);
-	return `AGENTS ${on}/${total}${edited ? " ✎" : ""}`;
+	const edited = Object.values(s.files).some((f) => Object.keys(f.edits).length > 0);
+	return `${on}/${total}${edited ? " ✎" : ""}`;
 }
 
 class TreeView {
@@ -423,7 +536,7 @@ class TreeView {
 		const { on, total } = counts(this.files, this.state);
 		const n = this.files.length;
 		const summary = this.state.allOff ? "ALL OFF" : `${n} file${n === 1 ? "" : "s"} · ${on}/${total} lines`;
-		const right = `${summary} · session/forward${this.vim ? " · vim" : ""} `;
+		const right = `${summary} · global${this.vim ? " · vim" : ""} `;
 		const title = " AGENTS context";
 		const gap = " ".repeat(Math.max(1, w - visibleWidth(title) - visibleWidth(right)));
 		const out: string[] = [
@@ -444,7 +557,7 @@ class TreeView {
 				const tag = isGlobal ? "Global  " : dirname(r.file) === this.cwd ? "cwd     " : "        ";
 				const arrow = this.folded.has(r.file) ? "▸" : "▾";
 				const mark = this.state.allOff || fs?.off ? t.fg("error", "○") : t.fg("success", "●");
-				const extra = [fs?.off ? "(file off)" : "", fs?.diskDirty ? "(written)" : "", `${f?.nodes.length ?? 0} lines`]
+				const extra = [fs?.off ? "(file off)" : "", `${f?.nodes.length ?? 0} lines`]
 					.filter(Boolean)
 					.join(" ");
 				line = `${arrow} ${mark} ${t.fg("accent", tag)}${t.bold(tilde(r.file))}  ${t.fg("dim", extra)}`;
@@ -503,98 +616,248 @@ function wrap(text: string, width: number): string[] {
 
 // ---------------------------------------------------------------- extension
 
-export default function agentsToggle(pi: ExtensionAPI) {
-	let state = emptyState();
+type Marker = { kind: "swap" } | { kind: "swapped" };
 
-	const loadFiles = (ctx: ExtensionContext): FileView[] => {
-		const agentDir = resolve(getAgentDir());
-		return loadProjectContextFiles({ cwd: ctx.cwd, agentDir }).map((f) => {
-			const content = existsSync(f.path) ? readFileSync(f.path, "utf8") : f.content;
-			const { nodes, roots } = parse(content);
-			return { path: f.path, content, nodes, roots };
+const MODE_LABELS: Record<Mode, string> = {
+	save: "Save only            new sessions get it; this session is untouched",
+	next: "Swap on next prompt  this session too, as if it always had it (invalidates cache)",
+	restart: "Restart now          fork this session with its history rewritten (invalidates cache)",
+};
+
+const sessionSystem = (e: { type: string; message?: unknown; systemMessage?: unknown }): SystemLike | undefined =>
+	e.type === "message" && isSystem(e.message)
+		? e.message
+		: e.type === "compaction" && isSystem(e.systemMessage)
+			? e.systemMessage
+			: undefined;
+
+/**
+ * Copy a session file with project_context replaced in its history: the leading prompt of
+ * every branch (and every compaction snapshot) carries `value`, and later section updates
+ * for project_context are removed. Returns the new file path.
+ */
+function forkWithContext(sourcePath: string, value: string | undefined): string {
+	const [headerLine, ...rest] = readFileSync(sourcePath, "utf8").split("\n").filter(Boolean);
+	const header = JSON.parse(headerLine);
+	// biome-ignore lint/suspicious/noExplicitAny: raw session JSONL entries
+	const entries: any[] = rest.map((l) => JSON.parse(l));
+	const byId = new Map(entries.map((e) => [e.id, e]));
+	const referenced = new Set(entries.flatMap((e) => [e.firstKeptEntryId, e.targetId, e.fromId].filter(Boolean)));
+	const hasSystemAncestor = (e: { parentId?: string | null }) => {
+		for (let p = e.parentId ? byId.get(e.parentId) : undefined; p; p = p.parentId ? byId.get(p.parentId) : undefined) {
+			if (sessionSystem(p)) return true;
+		}
+		return false;
+	};
+
+	const dropped = new Map<string, string | null>();
+	const leading = new Set(entries.filter((e) => sessionSystem(e) && (e.type === "compaction" || !hasSystemAncestor(e))));
+	const out = [];
+	for (const e of entries) {
+		const sys = sessionSystem(e);
+		if (sys && leading.has(e)) sys.sections = withSection(sys.sections ?? {}, value);
+		else if (sys?.sections && SECTION in sys.sections) {
+			delete sys.sections[SECTION];
+			const empty =
+				!Object.keys(sys.sections).length && !sys.toolsAdded?.length && !sys.toolsRemoved?.length && !String(sys.content ?? "");
+			if (empty && !referenced.has(e.id)) {
+				dropped.set(e.id, e.parentId ?? null);
+				continue;
+			}
+		}
+		out.push(e);
+	}
+	const parentOf = (id: string | null) => {
+		while (id && dropped.has(id)) id = dropped.get(id) ?? null;
+		return id;
+	};
+	for (const e of out) if ("parentId" in e) e.parentId = parentOf(e.parentId);
+
+	const id = randomUUID();
+	const timestamp = new Date().toISOString();
+	const path = join(dirname(sourcePath), `${timestamp.replace(/[:.]/g, "-")}_${id}.jsonl`);
+	const newHeader = { ...header, id, timestamp, parentSession: sourcePath };
+	writeFileSync(path, `${[newHeader, ...out].map((e) => JSON.stringify(e)).join("\n")}\n`);
+	return path;
+}
+
+export default function agentsToggle(pi: ExtensionAPI) {
+	/** Context files as on disk now, or [] when Pi was started without context files. */
+	const diskFiles = (ctx: ExtensionContext): ContextFile[] => {
+		if (piDisabledContext) return [];
+		return loadProjectContextFiles({ cwd: ctx.cwd, agentDir: resolve(getAgentDir()) }).map((f) => ({
+			path: f.path,
+			content: existsSync(f.path) ? stripBom(readFileSync(f.path, "utf8")) : f.content,
+		}));
+	};
+	let piDisabledContext = false;
+
+	const fileViews = (ctx: ExtensionContext): FileView[] =>
+		diskFiles(ctx).map((f) => {
+			const { nodes, roots } = parse(f.content);
+			return { ...f, nodes, roots };
 		});
+
+	/** What new sessions get: the files on disk with the global overlay applied. */
+	const fresh = (ctx: ExtensionContext) => applyAll(diskFiles(ctx), readConfig().state);
+
+	const markers = (ctx: ExtensionContext) => {
+		let swap = -1;
+		let swapped = -1;
+		ctx.sessionManager.getBranch().forEach((e, i) => {
+			if (e.type !== "custom" || e.customType !== ENTRY) return;
+			const kind = (e.data as Marker | undefined)?.kind;
+			if (kind === "swap") swap = i;
+			if (kind === "swapped") swapped = i;
+		});
+		return { pending: swap > swapped, collapsed: swapped >= 0 };
+	};
+
+	/** The context this session sends: whatever its transcript already carries, unless a swap is pending. */
+	const sessionFiles = (ctx: ExtensionContext): { files: ContextFile[]; pinned: boolean } => {
+		if (markers(ctx).pending) return { files: fresh(ctx), pinned: false };
+		const { has, value } = transcriptSection(ctx.sessionManager.buildSessionProjection().messages);
+		if (!has) return { files: fresh(ctx), pinned: false };
+		const files = parseSection(value);
+		// Only pin what round-trips exactly; anything else falls back to the fresh context.
+		if (renderSection(files) !== value) return { files: fresh(ctx), pinned: false };
+		return { files, pinned: true };
 	};
 
 	const updateStatus = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
-		const text = statusText(loadFiles(ctx), state);
-		const color = state.allOff ? "warning" : isDirty(state) ? "accent" : "dim";
-		ctx.ui.setStatus(ENTRY, ctx.ui.theme.fg(color, text));
+		const s = readConfig().state;
+		const label = stateLabel(fileViews(ctx), s);
+		const session = sessionFiles(ctx);
+		const differs = !sameFiles(session.files, fresh(ctx));
+		const suffix = markers(ctx).pending ? " (next prompt)" : differs ? " (next session)" : "";
+		const color = differs || markers(ctx).pending ? "warning" : s.allOff ? "warning" : isDirty(s) ? "accent" : "dim";
+		ctx.ui.setStatus(ENTRY, ctx.ui.theme.fg(color, `AGENTS ${label}${suffix}`));
 	};
 
-	const restore = (ctx: ExtensionContext) => {
-		state = emptyState();
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && entry.customType === ENTRY && entry.data) state = clone(entry.data as State);
+	const apply = async (ctx: ExtensionCommandContext, next: State, mode: Mode) => {
+		const before = readConfig().state;
+		const globalChanged = JSON.stringify(normalize(next)) !== JSON.stringify(normalize(before));
+		if (globalChanged) writeConfig({ state: next });
+		const saved = globalChanged ? "Saved for new sessions." : "Global settings unchanged.";
+
+		if (mode === "save") ctx.ui.notify(`${saved} This session is untouched.`, "info");
+		else if (mode === "next") {
+			pi.appendEntry<Marker>(ENTRY, { kind: "swap" });
+			ctx.ui.notify(`${saved} This session swaps on your next prompt (the prompt cache is rebuilt once).`, "info");
+		} else {
+			const file = ctx.sessionManager.getSessionFile();
+			const { has } = transcriptSection(ctx.sessionManager.buildSessionProjection().messages);
+			if (!file || !existsSync(file) || !has) {
+				// Nothing recorded yet: the next prompt already starts from the new context.
+				if (has) pi.appendEntry<Marker>(ENTRY, { kind: "swap" });
+				ctx.ui.notify(`${saved} This session has no saved prompt yet, so it uses the new context from the next prompt.`, "info");
+			} else {
+				await ctx.waitForIdle();
+				const path = forkWithContext(file, renderSection(fresh(ctx)));
+				const result = await ctx.switchSession(path, {
+					withSession: async (c) => c.ui.notify(`${saved} Restarted in a copy of the session with the new context in its history.`, "info"),
+				});
+				if (result.cancelled) ctx.ui.notify(`${saved} Restart cancelled; the copy is at ${tilde(path)}.`, "warning");
+				return;
+			}
 		}
 		updateStatus(ctx);
 	};
 
-	const commit = (ctx: ExtensionContext, next: State, note?: string) => {
-		const changed = JSON.stringify(next) !== JSON.stringify(state);
-		state = next;
-		if (changed) {
-			pi.appendEntry<State>(ENTRY, state);
-			ctx.ui.notify(note ?? "AGENTS context updated. It applies from your next message.", "info");
-		}
-		updateStatus(ctx);
+	const pickMode = async (ctx: ExtensionCommandContext): Promise<Mode | undefined> => {
+		const choice = await ctx.ui.select("Apply AGENTS changes", Object.values(MODE_LABELS));
+		return (Object.keys(MODE_LABELS) as Mode[]).find((m) => MODE_LABELS[m] === choice);
 	};
 
-	pi.on("session_start", (_e, ctx) => restore(ctx));
-	pi.on("session_tree", (_e, ctx) => restore(ctx));
+	pi.on("session_start", (_e, ctx) => {
+		piDisabledContext = false;
+		updateStatus(ctx);
+	});
+	pi.on("session_tree", (_e, ctx) => updateStatus(ctx));
+	pi.on("agent_end", (_e, ctx) => updateStatus(ctx));
 
-	pi.on("before_agent_start", (event) => {
-		if (!isDirty(state)) return;
-		event.systemPromptOptions.contextFiles = applyAll(event.systemPromptOptions.contextFiles ?? [], state);
+	pi.on("before_agent_start", (event, ctx) => {
+		// Respect `pi --no-context-files`: Pi loaded nothing although files exist.
+		const base = event.systemPromptOptions.contextFiles ?? [];
+		piDisabledContext =
+			base.length === 0 && loadProjectContextFiles({ cwd: ctx.cwd, agentDir: resolve(getAgentDir()) }).length > 0;
+		if (piDisabledContext) return;
+		const { pending } = markers(ctx);
+		event.systemPromptOptions.contextFiles = sessionFiles(ctx).files;
+		if (pending) pi.appendEntry<Marker>(ENTRY, { kind: "swapped" });
+	});
+
+	// After a swap, show the model one prompt that always had the new context.
+	pi.on("context_with_system", (event, ctx) => {
+		if (!markers(ctx).collapsed) return;
+		return { messages: collapse(event.messages) };
 	});
 
 	const openTree = async (ctx: ExtensionCommandContext) => {
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("/agents needs the interactive TUI. Use /agents on|off|reset here.", "warning");
+			ctx.ui.notify("/agents needs the interactive TUI. Use /agents on|off|reset [--next|--restart] here.", "warning");
 			return;
 		}
-		let working = clone(state);
+		let working = readConfig().state;
 		for (;;) {
-			const files = loadFiles(ctx);
+			const files = fileViews(ctx);
 			const agentDir = resolve(getAgentDir());
 			const result = await ctx.ui.custom<Result>(
 				(tui, theme, _kb, done) => new TreeView(tui, theme, files, working, resolve(ctx.cwd), agentDir, loadVim(), done),
 			);
 			if (result.kind === "cancel") return;
-			if (result.kind === "apply") return commit(ctx, result.state);
+			working = result.state;
+
+			if (result.kind === "apply") {
+				const unchanged = JSON.stringify(normalize(working)) === JSON.stringify(normalize(readConfig().state));
+				if (unchanged && sameFiles(sessionFiles(ctx).files, fresh(ctx))) {
+					ctx.ui.notify("No changes.", "info");
+					return;
+				}
+				const mode = await pickMode(ctx);
+				if (!mode) continue; // back to the tree with edits intact
+				return apply(ctx, working, mode);
+			}
 
 			// Edit a whole file on disk with Pi's editor, then come back to the tree.
-			working = result.state;
 			const original = readFileSync(result.path, "utf8");
 			const edited = await ctx.ui.editor(`Edit ${tilde(result.path)} (saves to disk)`, original);
 			if (edited !== undefined && edited !== original) {
-				const ok = await ctx.ui.confirm("Write to disk?", `Overwrite ${tilde(result.path)}? This affects future sessions too.`);
-				if (ok) {
-					writeFileSync(result.path, edited);
-					fileState(working, result.path).diskDirty = true;
-				}
+				const ok = await ctx.ui.confirm(
+					"Write to disk?",
+					`Overwrite ${tilde(result.path)}? New sessions use it; existing sessions keep what they started with.`,
+				);
+				if (ok) writeFileSync(result.path, edited);
 			}
 		}
 	};
 
+	const ARGS = ["on", "off", "reset"];
 	pi.registerCommand("agents", {
-		description: "Toggle or edit AGENTS.md context: /agents [on|off|reset]",
-		getArgumentCompletions: (prefix) =>
-			["on", "off", "reset"]
-				.filter((v) => v.startsWith(prefix.trim()))
-				.map((v) => ({ value: v, label: v, description: `AGENTS context ${v}` })),
-		handler: async (args, ctx) => {
-			const arg = args.trim();
-			if (arg === "off") return commit(ctx, { ...clone(state), allOff: true }, "AGENTS context off from your next message.");
-			if (arg === "on") return commit(ctx, { ...clone(state), allOff: false }, "AGENTS context on from your next message.");
-			if (arg === "reset") {
-				// keep diskDirty so a file written through /agents is still read fresh
-				const next = emptyState();
-				for (const [p, f] of Object.entries(state.files)) if (f.diskDirty) next.files[p] = { disabled: [], edits: {}, diskDirty: true };
-				return commit(ctx, next, "AGENTS context reset to the files on disk from your next message.");
+		description: "Toggle or edit AGENTS.md context: /agents [on|off|reset] [--next|--restart]",
+		getArgumentCompletions: (prefix) => {
+			const words = prefix.split(/\s+/);
+			if (words.length > 1) {
+				return ["--next", "--restart"]
+					.filter((v) => v.startsWith(words[words.length - 1]))
+					.map((v) => ({ value: `${words.slice(0, -1).join(" ")} ${v}`, label: v }));
 			}
-			if (arg) return ctx.ui.notify(`Unknown argument "${arg}". Use /agents, /agents on, /agents off, /agents reset.`, "warning");
-			await openTree(ctx);
+			return ARGS.filter((v) => v.startsWith(prefix.trim())).map((v) => ({ value: v, label: v, description: `AGENTS context ${v}` }));
+		},
+		handler: async (args, ctx) => {
+			const words = args.trim().split(/\s+/).filter(Boolean);
+			const flags = words.filter((w) => w.startsWith("--"));
+			const [verb, ...extra] = words.filter((w) => !w.startsWith("--"));
+			const bad = flags.find((f) => f !== "--next" && f !== "--restart");
+			if (!verb && !flags.length) return openTree(ctx);
+			if (!verb || !ARGS.includes(verb) || extra.length || bad || flags.length > 1) {
+				return ctx.ui.notify(`Usage: /agents, or /agents on|off|reset [--next|--restart] (got "${args}")`, "warning");
+			}
+			const mode: Mode = flags[0] === "--next" ? "next" : flags[0] === "--restart" ? "restart" : "save";
+			const cur = readConfig().state;
+			const next = verb === "reset" ? emptyState() : { ...cur, allOff: verb === "off" };
+			await apply(ctx, next, mode);
 		},
 	});
 }
