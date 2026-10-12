@@ -13,8 +13,8 @@
  *   restart  fork the session with the AGENTS block replaced in its stored history
  *            and switch to the fork now
  *
- *   /agents                       open the tree window
- *   /agents off|on|reset [--next|--restart]
+ *   /agents-md                       open the tree window
+ *   /agents-md off|on|reset [--next|--restart]
  */
 
 import { randomUUID } from "node:crypto";
@@ -796,7 +796,7 @@ export default function agentsToggle(pi: ExtensionAPI) {
 
 	const openTree = async (ctx: ExtensionCommandContext) => {
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("/agents needs the interactive TUI. Use /agents on|off|reset [--next|--restart] here.", "warning");
+			ctx.ui.notify("/agents-md needs the interactive TUI. Use /agents-md on|off|reset [--next|--restart] here.", "warning");
 			return;
 		}
 		let working = readConfig().state;
@@ -834,8 +834,8 @@ export default function agentsToggle(pi: ExtensionAPI) {
 	};
 
 	const ARGS = ["on", "off", "reset"];
-	pi.registerCommand("agents", {
-		description: "Toggle or edit AGENTS.md context: /agents [on|off|reset] [--next|--restart]",
+	pi.registerCommand("agents-md", {
+		description: "Toggle or edit AGENTS.md context: /agents-md [on|off|reset] [--next|--restart]",
 		getArgumentCompletions: (prefix) => {
 			const words = prefix.split(/\s+/);
 			if (words.length > 1) {
@@ -852,7 +852,7 @@ export default function agentsToggle(pi: ExtensionAPI) {
 			const bad = flags.find((f) => f !== "--next" && f !== "--restart");
 			if (!verb && !flags.length) return openTree(ctx);
 			if (!verb || !ARGS.includes(verb) || extra.length || bad || flags.length > 1) {
-				return ctx.ui.notify(`Usage: /agents, or /agents on|off|reset [--next|--restart] (got "${args}")`, "warning");
+				return ctx.ui.notify(`Usage: /agents-md, or /agents-md on|off|reset [--next|--restart] (got "${args}")`, "warning");
 			}
 			const mode: Mode = flags[0] === "--next" ? "next" : flags[0] === "--restart" ? "restart" : "save";
 			const cur = readConfig().state;

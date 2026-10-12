@@ -1,6 +1,6 @@
 {
   "name": "pi-agents-md-editor",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Toggle, edit, or empty AGENTS.md / CLAUDE.md context files from inside Pi, with a tree view, vim keys, and a status-bar indicator.",
   "keywords": ["pi-package", "pi", "agents-md", "context"],
   "license": "MIT",

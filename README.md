@@ -26,10 +26,10 @@ pi install git:github.com/vitalNohj/pi-agents-md-editor
 
 | Command | Effect |
 |---|---|
-| `/agents` | Open the tree window |
-| `/agents off` | Send no context files at all |
-| `/agents on` | Turn context files back on (line toggles are kept) |
-| `/agents reset` | Drop every toggle and edit |
+| `/agents-md` | Open the tree window |
+| `/agents-md off` | Send no context files at all |
+| `/agents-md on` | Turn context files back on (line toggles are kept) |
+| `/agents-md reset` | Drop every toggle and edit |
 
 `off`, `on` and `reset` take `--next` or `--restart` to choose an [apply mode](#apply-modes); without a flag they save only.
 
@@ -59,7 +59,7 @@ All loaded context files, in Pi's load order: the global file (`~/.pi/agent/AGEN
 
 Toggles and edits are a **global overlay** on top of the files on disk, saved in `~/.pi/agent/agents-md-editor.json` (along with the vim setting). The files themselves change only if you edit a whole file with `E` and confirm the write.
 
-**Every session keeps the context it started with.** A session reads its AGENTS context from its own saved system prompt, so later changes, whether through `/agents` or by editing the files, never leak into a session that has already been prompted, even after `/resume`.
+**Every session keeps the context it started with.** A session reads its AGENTS context from its own saved system prompt, so later changes, whether through `/agents-md` or by editing the files, never leak into a session that has already been prompted, even after `/resume`.
 
 ### Apply modes
 
