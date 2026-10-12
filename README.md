@@ -1,4 +1,4 @@
-# pi-agents-toggle
+# pi-agents-md-editor
 
 Toggle, edit, or empty your `AGENTS.md` / `CLAUDE.md` context files from inside [Pi](https://pi.dev), without touching the files on disk.
 
@@ -19,7 +19,7 @@ Useful for feeling "pure" model behavior, A/B testing a single rule, or muting o
 ## Install
 
 ```bash
-pi install git:github.com/vitalNohj/pi-agents-toggle
+pi install git:github.com/vitalNohj/pi-agents-md-editor
 ```
 
 ## Use
@@ -57,7 +57,7 @@ All loaded context files, in Pi's load order: the global file (`~/.pi/agent/AGEN
 
 ## How it works
 
-Toggles and edits are a **global overlay** on top of the files on disk, saved in `~/.pi/agent/agents-toggle.json` (along with the vim setting). The files themselves change only if you edit a whole file with `E` and confirm the write.
+Toggles and edits are a **global overlay** on top of the files on disk, saved in `~/.pi/agent/agents-md-editor.json` (along with the vim setting). The files themselves change only if you edit a whole file with `E` and confirm the write.
 
 **Every session keeps the context it started with.** A session reads its AGENTS context from its own saved system prompt, so later changes, whether through `/agents` or by editing the files, never leak into a session that has already been prompted, even after `/resume`.
 

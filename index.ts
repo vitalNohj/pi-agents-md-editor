@@ -1,8 +1,8 @@
 /**
- * pi-agents-toggle
+ * pi-agents-md-editor
  *
  * Toggle, edit, or empty AGENTS.md / CLAUDE.md context files from inside Pi.
- * Toggles and edits are a global overlay saved in <agent-dir>/agents-toggle.json;
+ * Toggles and edits are a global overlay saved in <agent-dir>/agents-md-editor.json;
  * files on disk stay untouched unless you explicitly write one with `E`.
  *
  * Every session keeps the context it started with. When you apply a change you
@@ -41,7 +41,7 @@ interface State {
 type ContextFile = { path: string; content: string };
 type Mode = "save" | "next" | "restart";
 
-const ENTRY = "agents-toggle";
+const ENTRY = "agents-md-editor";
 const SECTION = "project_context";
 const emptyState = (): State => ({ allOff: false, files: {} });
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
@@ -63,7 +63,7 @@ function normalize(s: State): State {
 
 // ---------------------------------------------------------------- global config
 
-const configPath = () => join(getAgentDir(), "agents-toggle.json");
+const configPath = () => join(getAgentDir(), "agents-md-editor.json");
 
 function readConfig(): { vim: boolean; state: State } {
 	try {
